@@ -11,6 +11,7 @@ import os
 import re
 import time
 import uuid
+import sqlite3
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, TypedDict
 
@@ -198,6 +199,9 @@ class BrowserContext:
 
 			await self.save_cookies()
 
+			# Save the captured network events into SQLite.
+			await self._save_network_events_to_sqlite()
+
 			if self.config.trace_path:
 				try:
 					await self.session.context.tracing.stop(path=os.path.join(self.config.trace_path, f'{self.context_id}.zip'))
@@ -281,6 +285,7 @@ class BrowserContext:
 		# Bring page to front
 		await active_page.bring_to_front()
 		await active_page.wait_for_load_state('load')
+		await self._setup_network_listeners(active_page)
 
 		return self.session
 
@@ -545,6 +550,116 @@ class BrowserContext:
 			page.remove_listener('response', on_response)
 
 		logger.debug(f'Network stabilized for {self.config.wait_for_network_idle_page_load_time} seconds')
+
+	async def _setup_network_listeners(self, page: Page):
+		"""
+		CUSTOM FUNCTION: agentic-web-use
+		Attaches network event listeners to capture complete network traffic,
+		including requests, responses, redirects, payloads, and cookies.
+		The captured events are stored in page._network_events as a dict keyed by a unique request identifier.
+		"""
+		# Initialize storage for network events on the page
+		page._network_events = {}
+
+		async def on_request(request):
+			req_id = request._guid if hasattr(request, "_guid") else id(request)
+			# Capture redirect chain (if any)
+			redirect_chain = []
+			r = request.redirected_from
+			while r:
+				# Attempt to capture basic data from the chain
+				try:
+					prev_response = r.response()
+					prev_status = prev_response.status if prev_response else None
+				except Exception:
+					prev_status = None
+				redirect_chain.append({
+					'url': r.url,
+					'status': prev_status,
+				})
+				r = r.redirected_from
+
+			page._network_events[req_id] = {
+				'page_url': page.url,
+				'request': {
+					'url': request.url,
+					'method': request.method,
+					'headers': request.headers,
+					'postData': request.post_data,
+					'cookies': request.headers.get('cookie', None),
+				},
+				'redirect_chain': redirect_chain,
+				'response': None,
+				'error': None,
+				'timestamp': time.time(),
+				'finished_at': None,
+			}
+
+		async def on_response(response):
+			req = response.request
+			req_id = req._guid if hasattr(req, "_guid") else id(req)
+			try:
+				body = await response.body()
+				# If body is binary, convert to a base64 string; otherwise, decode as UTF-8.
+				try:
+					body_str = body.decode('utf-8')
+				except UnicodeDecodeError:
+					body_str = base64.b64encode(body).decode('utf-8')
+			except Exception:
+				body_str = None
+
+			# Capture set-cookie header if present
+			set_cookie = response.headers.get('set-cookie', None)
+
+			event = page._network_events.get(req_id, {
+				'request': {},
+				'redirect_chain': [],
+				'error': None,
+				'timestamp': time.time(),
+				'finished_at': None,
+			})
+			event['response'] = {
+				'url': response.url,
+				'status': response.status,
+				'statusText': response.status_text,
+				'headers': response.headers,
+				'set_cookie': set_cookie,
+				'body': body_str,
+				'timestamp': time.time(),
+			}
+			page._network_events[req_id] = event
+
+		async def on_request_finished(request):
+			req_id = request._guid if hasattr(request, "_guid") else id(request)
+			if req_id in page._network_events:
+				page._network_events[req_id]['finished_at'] = time.time()
+
+		async def on_request_failed(request):
+			req_id = request._guid if hasattr(request, "_guid") else id(request)
+			# Some requests may have a failure object with an error_text
+			error_msg = getattr(request.failure, 'error_text', "Unknown error")
+			if req_id in page._network_events:
+				page._network_events[req_id]['error'] = error_msg
+			else:
+				page._network_events[req_id] = {
+					'request': {
+						'url': request.url,
+						'method': request.method,
+						'headers': request.headers,
+						'postData': request.post_data,
+						'cookies': request.headers.get('cookie', None),
+					},
+					'redirect_chain': [],
+					'response': None,
+					'error': error_msg,
+					'timestamp': time.time(),
+					'finished_at': None,
+				}
+		page.on('request', on_request)
+		page.on('response', on_response)
+		page.on('requestfinished', on_request_finished)
+		page.on('requestfailed', on_request_failed)
+	
 
 	async def _wait_for_page_and_frames_load(self, timeout_overwrite: float | None = None):
 		"""
@@ -1345,3 +1460,108 @@ class BrowserContext:
 		except Exception as e:
 			logger.debug(f'Failed to get CDP targets: {e}')
 			return []
+
+	async def _save_network_events_to_sqlite(self):
+		"""
+		CUSTOM METHOD: agentic-web-use
+		Aggregates network events from all pages in the current session and saves them
+		into an SQLite file under the output/ directory.
+		"""
+		import sqlite3
+		import json
+		import os
+		from urllib.parse import urlparse
+
+		# Determine page_url from collected network events
+		page_url = "unknown"
+		if self.session and getattr(self.session, "context", None):
+			for page in self.session.context.pages:
+				if hasattr(page, "_network_events"):
+					for event in page._network_events.values():
+						if "page_url" in event and event["page_url"]:
+							parsed = urlparse(event["page_url"])
+							if parsed.netloc:
+								page_url = parsed.netloc
+								break  # Stop at the first valid page_url
+		
+		# Create output directory if it doesn't exist.
+		output_dir = "output"
+		os.makedirs(output_dir, exist_ok=True)
+
+		# Construct final database file path
+		db_path = os.path.join(output_dir, f"{page_url}.db")
+
+		# Open a connection to the SQLite database.
+		conn = sqlite3.connect(db_path)
+		cur = conn.cursor()
+
+		# Create a table to store network events.
+		cur.execute('''
+			CREATE TABLE IF NOT EXISTS network_events (
+				id TEXT PRIMARY KEY,
+				page_url TEXT,
+				request_url TEXT,
+				request_method TEXT,
+				request_headers TEXT,
+				request_postData TEXT,
+				request_cookies TEXT,
+				redirect_chain TEXT,
+				request_timestamp REAL,
+				finished_at REAL,
+				error TEXT,
+				response_url TEXT,
+				response_status INTEGER,
+				response_status_text TEXT,
+				response_headers TEXT,
+				response_set_cookie TEXT,
+				response_body TEXT,
+				response_timestamp REAL
+			)
+		''')
+		conn.commit()
+
+		# Gather network events from all pages in the current context.
+		events = {}
+		if self.session and getattr(self.session, "context", None):
+			for page in self.session.context.pages:
+				if hasattr(page, "_network_events"):
+					events.update(page._network_events)
+		else:
+			logger.debug("No session context available; skipping network events saving.")
+			conn.close()
+			return
+
+		# Insert each event into the database.
+		for req_id, event in events.items():
+			req = event.get('request', {})
+			resp = event.get('response', {}) or {}
+			cur.execute('''
+				INSERT OR REPLACE INTO network_events (
+					id, page_url, request_url, request_method, request_headers, request_postData,
+					request_cookies, redirect_chain, request_timestamp, finished_at,
+					error, response_url, response_status, response_status_text,
+					response_headers, response_set_cookie, response_body, response_timestamp
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			''', (
+				str(req_id),
+				event.get('page_url'),
+				req.get('url'),
+				req.get('method'),
+				json.dumps(req.get('headers', {})),
+				req.get('postData'),
+				req.get('cookies'),
+				json.dumps(event.get('redirect_chain', [])),
+				event.get('timestamp'),
+				event.get('finished_at'),
+				event.get('error'),
+				resp.get('url'),
+				resp.get('status'),
+				resp.get('statusText'),
+				json.dumps(resp.get('headers', {})),
+				resp.get('set_cookie'),
+				resp.get('body'),
+				resp.get('timestamp'),
+			))
+		conn.commit()
+		conn.close()
+		logger.debug(f"Network events saved to SQLite database at {db_path}")

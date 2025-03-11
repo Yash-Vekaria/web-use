@@ -188,3 +188,9 @@ gcp-login.json
 *.jsonl
 
 uv.lock
+
+
+# Custom
+.env
+logs/
+output/
