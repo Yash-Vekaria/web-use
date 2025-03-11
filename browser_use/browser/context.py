@@ -285,7 +285,7 @@ class BrowserContext:
 		# Bring page to front
 		await active_page.bring_to_front()
 		await active_page.wait_for_load_state('load')
-		await self._setup_network_listeners(active_page)
+		await self.attach_listeners(active_page, playwright_browser)
 
 		return self.session
 
@@ -551,23 +551,19 @@ class BrowserContext:
 
 		logger.debug(f'Network stabilized for {self.config.wait_for_network_idle_page_load_time} seconds')
 
-	async def _setup_network_listeners(self, page: Page):
+	async def _setup_network_listeners(self, page: Page, browser):
 		"""
-		CUSTOM FUNCTION: agentic-web-use
-		Attaches network event listeners to capture complete network traffic,
-		including requests, responses, redirects, payloads, and cookies.
-		The captured events are stored in page._network_events as a dict keyed by a unique request identifier.
+		Attaches network event listeners to capture complete network traffic
+		for all pages (including new tabs, popups, and iframes).
 		"""
 		# Initialize storage for network events on the page
 		page._network_events = {}
 
 		async def on_request(request):
 			req_id = request._guid if hasattr(request, "_guid") else id(request)
-			# Capture redirect chain (if any)
 			redirect_chain = []
 			r = request.redirected_from
 			while r:
-				# Attempt to capture basic data from the chain
 				try:
 					prev_response = r.response()
 					prev_status = prev_response.status if prev_response else None
@@ -600,7 +596,6 @@ class BrowserContext:
 			req_id = req._guid if hasattr(req, "_guid") else id(req)
 			try:
 				body = await response.body()
-				# If body is binary, convert to a base64 string; otherwise, decode as UTF-8.
 				try:
 					body_str = body.decode('utf-8')
 				except UnicodeDecodeError:
@@ -608,7 +603,6 @@ class BrowserContext:
 			except Exception:
 				body_str = None
 
-			# Capture set-cookie header if present
 			set_cookie = response.headers.get('set-cookie', None)
 
 			event = page._network_events.get(req_id, {
@@ -636,7 +630,6 @@ class BrowserContext:
 
 		async def on_request_failed(request):
 			req_id = request._guid if hasattr(request, "_guid") else id(request)
-			# Some requests may have a failure object with an error_text
 			error_msg = getattr(request.failure, 'error_text', "Unknown error")
 			if req_id in page._network_events:
 				page._network_events[req_id]['error'] = error_msg
@@ -655,11 +648,48 @@ class BrowserContext:
 					'timestamp': time.time(),
 					'finished_at': None,
 				}
+
+		# Attach event listeners to the page
 		page.on('request', on_request)
 		page.on('response', on_response)
 		page.on('requestfinished', on_request_finished)
 		page.on('requestfailed', on_request_failed)
-	
+
+		# Attach event listeners to all existing frames within the page
+		for frame in page.frames:
+			frame.on('request', on_request)
+			frame.on('response', on_response)
+			frame.on('requestfinished', on_request_finished)
+			frame.on('requestfailed', on_request_failed)
+
+		# Handle dynamically added iframes
+		def on_frame_attached(frame):
+			frame.on('request', on_request)
+			frame.on('response', on_response)
+			frame.on('requestfinished', on_request_finished)
+			frame.on('requestfailed', on_request_failed)
+
+		page.on("frameattached", on_frame_attached)
+
+		# Handle new popups (e.g., from clicking links with target="_blank")
+		page.on("popup", lambda popup: asyncio.create_task(self._setup_network_listeners(popup, browser)))
+
+
+	# Attaching listeners when a new page is opened
+	async def attach_listeners(self, active_page: Page, browser):
+		# Bring page to front
+		await active_page.bring_to_front()
+		await active_page.wait_for_load_state('load')
+
+		# Attach listeners to the main page
+		await self._setup_network_listeners(active_page, browser)
+
+		# Attach listeners to new pages dynamically
+		try:
+			self.browser.on("page", lambda page: asyncio.create_task(self._setup_network_listeners(page, self.browser)))
+		except Exception as e:
+			print(f'****** Failed to attach page listener: {e}')
+
 
 	async def _wait_for_page_and_frames_load(self, timeout_overwrite: float | None = None):
 		"""
