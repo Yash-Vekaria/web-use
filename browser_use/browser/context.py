@@ -11,7 +11,6 @@ import os
 import re
 import time
 import uuid
-import sqlite3
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, TypedDict
 
@@ -35,6 +34,12 @@ from browser_use.browser.views import (
 from browser_use.dom.service import DomService
 from browser_use.dom.views import DOMElementNode, SelectorMap
 from browser_use.utils import time_execution_async, time_execution_sync
+
+# CUSTOM CODE: agentic-web-use
+import sqlite3, json, time, base64, asyncio
+from urllib.parse import urlparse
+import zlib
+from playwright.async_api import Request, Response
 
 if TYPE_CHECKING:
 	from browser_use.browser.browser import Browser
@@ -164,6 +169,8 @@ class BrowserContext:
 
 		self.config = config
 		self.browser = browser
+		self._network_db_conn = None  # CUSTOM CODE: agentic-web-use
+		self._first_non_blank_domain = None  # CUSTOM CODE: agentic-web-use
 
 		self.state = state or BrowserContextState()
 
@@ -199,8 +206,8 @@ class BrowserContext:
 
 			await self.save_cookies()
 
-			# Save the captured network events into SQLite.
-			await self._save_network_events_to_sqlite()
+			# CUSTOM CODE: agentic-web-use
+			await self.capture_storage_data()
 
 			if self.config.trace_path:
 				try:
@@ -219,6 +226,9 @@ class BrowserContext:
 			# Dereference everything
 			self.session = None
 			self._page_event_handler = None
+			
+			# Rename the DB file based on captured page_domain.
+			self.update_db_filename() # CUSTOM CODE: agentic-web-use
 
 	def __del__(self):
 		"""Cleanup when object is destroyed"""
@@ -285,7 +295,15 @@ class BrowserContext:
 		# Bring page to front
 		await active_page.bring_to_front()
 		await active_page.wait_for_load_state('load')
-		await self.attach_listeners(active_page, playwright_browser)
+		
+		# CUSTOM CODE: agentic-web-use
+		# If the active page URL is non-"about:blank" and the first non-blank domain is not set, do so now.
+		if not active_page.url.startswith("about:blank") and (not hasattr(self, "_first_non_blank_domain") or not self._first_non_blank_domain):
+			parsed = urlparse(active_page.url)
+			self._first_non_blank_domain = parsed.netloc or "unknown_domain"
+		await self._setup_network_listeners(active_page)
+
+
 
 		return self.session
 
@@ -295,6 +313,7 @@ class BrowserContext:
 				await page.reload()  # Reload the page to avoid timeout errors
 			await page.wait_for_load_state()
 			logger.debug(f'New page opened: {page.url}')
+			await self._setup_network_listeners(page) # CUSTOM CODE: agentic-web-use
 			if self.session is not None:
 				self.state.target_id = None
 
@@ -550,146 +569,6 @@ class BrowserContext:
 			page.remove_listener('response', on_response)
 
 		logger.debug(f'Network stabilized for {self.config.wait_for_network_idle_page_load_time} seconds')
-
-	async def _setup_network_listeners(self, page: Page, browser):
-		"""
-		Attaches network event listeners to capture complete network traffic
-		for all pages (including new tabs, popups, and iframes).
-		"""
-		# Initialize storage for network events on the page
-		page._network_events = {}
-
-		async def on_request(request):
-			req_id = request._guid if hasattr(request, "_guid") else id(request)
-			redirect_chain = []
-			r = request.redirected_from
-			while r:
-				try:
-					prev_response = r.response()
-					prev_status = prev_response.status if prev_response else None
-				except Exception:
-					prev_status = None
-				redirect_chain.append({
-					'url': r.url,
-					'status': prev_status,
-				})
-				r = r.redirected_from
-
-			page._network_events[req_id] = {
-				'page_url': page.url,
-				'request': {
-					'url': request.url,
-					'method': request.method,
-					'headers': request.headers,
-					'postData': request.post_data,
-					'cookies': request.headers.get('cookie', None),
-				},
-				'redirect_chain': redirect_chain,
-				'response': None,
-				'error': None,
-				'timestamp': time.time(),
-				'finished_at': None,
-			}
-
-		async def on_response(response):
-			req = response.request
-			req_id = req._guid if hasattr(req, "_guid") else id(req)
-			try:
-				body = await response.body()
-				try:
-					body_str = body.decode('utf-8')
-				except UnicodeDecodeError:
-					body_str = base64.b64encode(body).decode('utf-8')
-			except Exception:
-				body_str = None
-
-			set_cookie = response.headers.get('set-cookie', None)
-
-			event = page._network_events.get(req_id, {
-				'request': {},
-				'redirect_chain': [],
-				'error': None,
-				'timestamp': time.time(),
-				'finished_at': None,
-			})
-			event['response'] = {
-				'url': response.url,
-				'status': response.status,
-				'statusText': response.status_text,
-				'headers': response.headers,
-				'set_cookie': set_cookie,
-				'body': body_str,
-				'timestamp': time.time(),
-			}
-			page._network_events[req_id] = event
-
-		async def on_request_finished(request):
-			req_id = request._guid if hasattr(request, "_guid") else id(request)
-			if req_id in page._network_events:
-				page._network_events[req_id]['finished_at'] = time.time()
-
-		async def on_request_failed(request):
-			req_id = request._guid if hasattr(request, "_guid") else id(request)
-			error_msg = getattr(request.failure, 'error_text', "Unknown error")
-			if req_id in page._network_events:
-				page._network_events[req_id]['error'] = error_msg
-			else:
-				page._network_events[req_id] = {
-					'request': {
-						'url': request.url,
-						'method': request.method,
-						'headers': request.headers,
-						'postData': request.post_data,
-						'cookies': request.headers.get('cookie', None),
-					},
-					'redirect_chain': [],
-					'response': None,
-					'error': error_msg,
-					'timestamp': time.time(),
-					'finished_at': None,
-				}
-
-		# Attach event listeners to the page
-		page.on('request', on_request)
-		page.on('response', on_response)
-		page.on('requestfinished', on_request_finished)
-		page.on('requestfailed', on_request_failed)
-
-		# Attach event listeners to all existing frames within the page
-		for frame in page.frames:
-			frame.on('request', on_request)
-			frame.on('response', on_response)
-			frame.on('requestfinished', on_request_finished)
-			frame.on('requestfailed', on_request_failed)
-
-		# Handle dynamically added iframes
-		def on_frame_attached(frame):
-			frame.on('request', on_request)
-			frame.on('response', on_response)
-			frame.on('requestfinished', on_request_finished)
-			frame.on('requestfailed', on_request_failed)
-
-		page.on("frameattached", on_frame_attached)
-
-		# Handle new popups (e.g., from clicking links with target="_blank")
-		page.on("popup", lambda popup: asyncio.create_task(self._setup_network_listeners(popup, browser)))
-
-
-	# Attaching listeners when a new page is opened
-	async def attach_listeners(self, active_page: Page, browser):
-		# Bring page to front
-		await active_page.bring_to_front()
-		await active_page.wait_for_load_state('load')
-
-		# Attach listeners to the main page
-		await self._setup_network_listeners(active_page, browser)
-
-		# Attach listeners to new pages dynamically
-		try:
-			self.browser.on("page", lambda page: asyncio.create_task(self._setup_network_listeners(page, self.browser)))
-		except Exception as e:
-			print(f'****** Failed to attach page listener: {e}')
-
 
 	async def _wait_for_page_and_frames_load(self, timeout_overwrite: float | None = None):
 		"""
@@ -1229,10 +1108,16 @@ class BrowserContext:
 				pass
 
 			# Get element properties to determine input method
+			tag_handle = await element_handle.get_property("tagName")
+			tag_name = (await tag_handle.json_value()).lower()
 			is_contenteditable = await element_handle.get_property('isContentEditable')
+			readonly_handle = await element_handle.get_property("readOnly")
+			disabled_handle = await element_handle.get_property("disabled")
 
-			# Different handling for contenteditable vs input fields
-			if await is_contenteditable.json_value():
+			readonly = await readonly_handle.json_value() if readonly_handle else False
+			disabled = await disabled_handle.json_value() if disabled_handle else False
+
+			if (await is_contenteditable.json_value() or tag_name == 'input') and not (readonly or disabled):
 				await element_handle.evaluate('el => el.textContent = ""')
 				await element_handle.type(text, delay=5)
 			else:
@@ -1448,6 +1333,527 @@ class BrowserContext:
 		pixels_above = scroll_y
 		pixels_below = total_height - (scroll_y + viewport_height)
 		return pixels_above, pixels_below
+	
+	
+	# CUSTOM CODE: agentic-web-use
+	# region - Network Traffic and Per-Page Storage Capture
+	async def _setup_network_listeners(self, page: Page) -> None:
+		"""
+		Attaches network event listeners to capture complete network traffic,
+		including requests, responses, redirects, payloads, cookies, and stack traces.
+		This covers the main frame, all static and dynamic iframes, and new tabs/popups.
+		"""
+		if not hasattr(page, "_network_events"):
+			page._network_events = {}
+		page.on("request", lambda request: asyncio.create_task(self._on_request(request)))
+		page.on("response", lambda response: asyncio.create_task(self._on_response(response)))
+		page.on("requestfinished", lambda request: asyncio.create_task(self._on_request_finished(request)))
+		page.on("requestfailed", lambda request: asyncio.create_task(self._on_request_failed(request)))
+		# Attach listeners to new tabs/popups.
+		page.on("popup", lambda popup: asyncio.create_task(self._setup_network_listeners(popup)))
+		# Log frame attachments for debugging; network events from iframes are captured at the page level.
+		page.on("frameattached", lambda frame: logger.debug(f"Frame attached: {frame.url}"))
+		# Set up a CDP session to capture initiator/stack trace info.
+		try:
+			cdp_session = await page.context.new_cdp_session(page)
+			await cdp_session.send("Network.enable")
+			page._cdp_network_info = {}
+			cdp_session.on("Network.requestWillBeSent", lambda event: self._store_cdp_initiator(page, event))
+		except Exception as e:
+			logger.error(f"CDP session setup failed: {e}")
+
+
+	def _store_cdp_initiator(self, page: Page, event: dict) -> None:
+		"""
+		Stores initiator information (which may include stack trace details)
+		from the CDP Network.requestWillBeSent event.
+		"""
+		request_id = event.get("requestId")
+		if request_id:
+			page._cdp_network_info[request_id] = event.get("initiator")
+
+
+	async def _on_request(self, request: Request) -> None:
+		try:
+			# Unique request identifier.
+			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
+			
+			# Determine the page URL from the main frame.
+			page_obj = getattr(request, "page", None)
+			if page_obj:
+				try:
+					page_url = page_obj.main_frame.url
+				except Exception:
+					page_url = page_obj.url
+			else:
+				page_url = request.url
+			parsed = urlparse(page_url)
+			page_domain = parsed.netloc if parsed.netloc else ""
+			
+			# Initialize the DB connection if not already done.
+			if self._network_db_conn is None:
+				try:
+					current_dir = os.path.dirname(os.path.abspath(__file__))
+				except Exception:
+					current_dir = os.getcwd()
+				output_dir = os.path.abspath(os.path.join(current_dir, "..", "..", "output"))
+				os.makedirs(output_dir, exist_ok=True)
+				db_path = os.path.join(output_dir, "temp.db")
+				self._network_db_conn = sqlite3.connect(db_path, check_same_thread=False)
+				self._network_db_conn.execute("""
+					CREATE TABLE IF NOT EXISTS network_traffic (
+						request_id TEXT PRIMARY KEY,
+						page_url TEXT,
+						page_domain TEXT,
+						request_url TEXT,
+						request_method TEXT,
+						request_headers TEXT,
+						request_postData TEXT,
+						request_cookies TEXT,
+						redirect_chain TEXT,
+						request_timestamp REAL,
+						finished_at REAL,
+						error TEXT,
+						response_url TEXT,
+						response_status INTEGER,
+						response_headers TEXT,
+						response_set_cookies TEXT,
+						response_body TEXT,
+						response_timestamp REAL,
+						stack_trace TEXT
+					)
+				""")
+				self._network_db_conn.execute("""
+					CREATE TABLE IF NOT EXISTS storage (
+						page_url TEXT,
+						storage_type TEXT,
+						storage_domain TEXT,
+						key TEXT,
+						value TEXT,
+						other_attributes TEXT,
+						UNIQUE (page_url, storage_type, storage_domain, key)
+					)
+				""")
+				self._network_db_conn.commit()
+			
+			req_timestamp = time.time()
+			
+			# Build the redirect chain.
+			redirect_chain = []
+			r = request.redirected_from
+			while r:
+				try:
+					prev_resp = await r.response()
+					prev_status = prev_resp.status if prev_resp else None
+				except Exception:
+					prev_status = None
+				redirect_chain.append({'url': r.url, 'status': prev_status})
+				r = getattr(r, "redirected_from", None)
+			
+			# Helper to safely decode bytes.
+			def safe_decode(value):
+				try:
+					if isinstance(value, (bytes, bytearray)):
+						if value.startswith(b'\x1f\x8b'):
+							return "GZIP_DATA"
+						try:
+							return value.decode("utf-8")
+						except Exception:
+							return base64.b64encode(value).decode("utf-8")
+					else:
+						return str(value)
+				except Exception as e:
+					logger.error(f"safe_decode error: {e}")
+					return ""
+			
+			# Process post_data.
+			post_data = request.post_data
+			if isinstance(post_data, (bytes, bytearray)):
+				if post_data.startswith(b'\x1f\x8b'):
+					post_data = "GZIP_DATA"
+				else:
+					try:
+						post_data = post_data.decode("utf-8")
+					except Exception:
+						post_data = base64.b64encode(post_data).decode("utf-8")
+			elif post_data is None:
+				post_data = ""
+			else:
+				post_data = str(post_data)
+			
+			safe_headers = {k: safe_decode(v) for k, v in request.headers.items()}
+			request_cookies = safe_decode(request.headers.get("cookie", ""))
+			
+			# Retrieve stack trace.
+			stack_trace = ""
+			try:
+				if hasattr(request, "_impl_obj") and hasattr(request._impl_obj, "_initializer"):
+					initializer = request._impl_obj._initializer
+					if "stackTrace" in initializer:
+						stack_trace = json.dumps(initializer["stackTrace"])
+				if not stack_trace and page_obj and hasattr(page_obj, "_cdp_network_info"):
+					for _, initiator in page_obj._cdp_network_info.items():
+						if initiator and "stack" in initiator:
+							stack_trace = json.dumps(initiator.get("stack", {}))
+							break
+			except Exception as e:
+				logger.error(f"Error getting stack trace: {e}")
+			
+			# Insert network data.
+			conn = self._network_db_conn
+			if conn is not None:
+				conn.execute("""
+					INSERT INTO network_traffic (
+						request_id, page_url, page_domain, request_url, request_method, request_headers, request_postData,
+						request_cookies, redirect_chain, request_timestamp, stack_trace
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				""", (
+					req_id,
+					page_url,
+					page_domain,
+					request.url,
+					request.method,
+					json.dumps(safe_headers),
+					post_data,
+					request_cookies,
+					json.dumps(redirect_chain),
+					req_timestamp,
+					stack_trace
+				))
+				conn.commit()
+			
+			if page_obj is not None:
+				if not hasattr(page_obj, "_network_events"):
+					page_obj._network_events = {}
+				page_obj._network_events[req_id] = {"timestamp": req_timestamp}
+			
+			print("*Req*", req_id, request.url)
+		except Exception as e:
+			logger.error(f"Error in _on_request: {e}")
+
+
+	async def _on_response(self, response: Response) -> None:
+		try:
+			request = response.request
+			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
+			resp_timestamp = time.time()
+			headers = response.headers
+			# Capture set-cookie header.
+			response_set_cookies = headers.get("set-cookie", "")
+			try:
+				body_bytes = await response.body()
+				try:
+					body_str = body_bytes.decode("utf-8")
+				except UnicodeDecodeError:
+					if body_bytes.startswith(b'\x1f\x8b'):
+						try:
+							body_str = zlib.decompress(body_bytes, zlib.MAX_WBITS | 16).decode("utf-8")
+						except Exception:
+							body_str = "GZIP_DATA"
+					else:
+						body_str = base64.b64encode(body_bytes).decode("utf-8")
+			except Exception:
+				body_str = ""
+			conn = self._network_db_conn
+			if conn is not None:
+				conn.execute("""
+					UPDATE network_traffic
+					SET response_url = ?, response_status = ?, response_headers = ?, response_set_cookies = ?,
+						response_body = ?, response_timestamp = ?
+					WHERE request_id = ?
+				""", (
+					response.url,
+					response.status,
+					json.dumps(headers),
+					response_set_cookies,
+					body_str,
+					resp_timestamp,
+					req_id
+				))
+				conn.commit()
+			print("*Resp*", req_id, response.url)
+		except Exception as e:
+			logger.error(f"Error in _on_response: {e}")
+
+
+	async def _on_request_finished(self, request: Request) -> None:
+		try:
+			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
+			finished_at = time.time()
+			conn = self._network_db_conn
+			if conn is not None:
+				conn.execute("""
+					UPDATE network_traffic
+					SET finished_at = ?
+					WHERE request_id = ?
+				""", (finished_at, req_id))
+				conn.commit()
+		except Exception as e:
+			logger.error(f"Error in _on_request_finished: {e}")
+
+
+	async def _on_request_failed(self, request: Request) -> None:
+		try:
+			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
+			fail_timestamp = time.time()
+			error_msg = "Request failed"
+			conn = self._network_db_conn
+			if conn is not None:
+				conn.execute("""
+					UPDATE network_traffic
+					SET error = ?,
+						finished_at = ?,
+						response_timestamp = ?
+					WHERE request_id = ?
+				""", (
+					error_msg,
+					fail_timestamp,
+					fail_timestamp,
+					req_id
+				))
+				conn.commit()
+		except Exception as e:
+			logger.error(f"Error in _on_request_failed: {e}")
+
+
+	async def capture_storage_data(self) -> None:
+		try:
+			captured_at = time.time()
+			# Initialize DB if not already done.
+			if self._network_db_conn is None:
+				try:
+					current_dir = os.path.dirname(os.path.abspath(__file__))
+				except Exception:
+					current_dir = os.getcwd()
+				output_dir = os.path.abspath(os.path.join(current_dir, "..", "..", "output"))
+				os.makedirs(output_dir, exist_ok=True)
+				db_path = os.path.join(output_dir, "temp.db")
+				self._network_db_conn = sqlite3.connect(db_path, check_same_thread=False)
+				self._network_db_conn.execute("""
+					CREATE TABLE IF NOT EXISTS network_traffic (
+						request_id TEXT PRIMARY KEY,
+						page_url TEXT,
+						page_domain TEXT,
+						request_url TEXT,
+						request_method TEXT,
+						request_headers TEXT,
+						request_postData TEXT,
+						request_cookies TEXT,
+						redirect_chain TEXT,
+						request_timestamp REAL,
+						finished_at REAL,
+						error TEXT,
+						response_url TEXT,
+						response_status INTEGER,
+						response_headers TEXT,
+						response_set_cookies TEXT,
+						response_body TEXT,
+						response_timestamp REAL,
+						stack_trace TEXT
+					)
+				""")
+				self._network_db_conn.execute("""
+					CREATE TABLE IF NOT EXISTS storage (
+						page_url TEXT,
+						storage_type TEXT,
+						storage_domain TEXT,
+						key TEXT,
+						value TEXT,
+						other_attributes TEXT,
+						UNIQUE (page_url, storage_type, storage_domain, key)
+					)
+				""")
+				self._network_db_conn.commit()
+			
+			conn = self._network_db_conn
+			if not (self.session and hasattr(self.session, "context")):
+				print("[ERROR] self.session or self.session.context is None")
+				return
+			
+			for page in self.session.context.pages:
+				page_url = page.url
+				if page_url.startswith("about:blank"):
+					continue
+				print("Capturing storage for page:", page_url)
+				try:
+					cookies = await self.session.context.cookies([page_url])
+					print("Page cookies:", cookies)
+					for cookie in cookies:
+						storage_domain = cookie.get("domain", "")
+						key = cookie.get("name", "")
+						value = cookie.get("value", "")
+						other_attrs = {k: v for k, v in cookie.items() if k not in ["name", "value", "domain"]}
+						cursor = conn.execute(
+							"SELECT 1 FROM storage WHERE storage_type = 'cookies' AND storage_domain = ? AND key = ? AND value = ?",
+							(storage_domain, key, value)
+						)
+						if cursor.fetchone() is None:
+							conn.execute("""
+							INSERT OR IGNORE INTO storage (page_url, storage_type, storage_domain, key, value, other_attributes)
+							VALUES (?, 'cookies', ?, ?, ?, ?)
+							""", (page_url, storage_domain, key, value, json.dumps(other_attrs)))
+				except Exception as e:
+					logger.error(f"Error capturing cookies for {page_url}: {e}")
+				
+				try:
+					local_storage = await page.evaluate("""
+					() => {
+						let ls = {};
+						for (let i = 0; i < localStorage.length; i++) {
+							let key = localStorage.key(i);
+							ls[key] = localStorage.getItem(key);
+						}
+						return ls;
+					}
+					""")
+					print("LocalStorage:", local_storage)
+					if isinstance(local_storage, dict):
+						for key, value in local_storage.items():
+							cursor = conn.execute(
+								"SELECT storage_domain FROM storage WHERE storage_type = 'localStorage' AND key = ? AND value = ?",
+								(key, value)
+							)
+							row = cursor.fetchone()
+							if row:
+								if not row[0]:
+									parsed = urlparse(page_url)
+									storage_domain = parsed.netloc
+									conn.execute(
+										"UPDATE storage SET storage_domain = ? WHERE storage_type = 'localStorage' AND key = ? AND value = ?",
+										(storage_domain, key, value)
+									)
+							else:
+								conn.execute("""
+								INSERT OR IGNORE INTO storage (page_url, storage_type, storage_domain, key, value, other_attributes)
+								VALUES (?, 'localStorage', '', ?, ?, '')
+								""", (page_url, key, value))
+				except Exception as e:
+					logger.error(f"Error capturing localStorage for {page_url}: {e}")
+				
+				try:
+					session_storage = await page.evaluate("""
+					() => {
+						let ss = {};
+						for (let i = 0; i < sessionStorage.length; i++) {
+							let key = sessionStorage.key(i);
+							ss[key] = sessionStorage.getItem(key);
+						}
+						return ss;
+					}
+					""")
+					print("SessionStorage:", session_storage)
+					if isinstance(session_storage, dict):
+						for key, value in session_storage.items():
+							conn.execute("""
+							INSERT OR IGNORE INTO storage (page_url, storage_type, storage_domain, key, value, other_attributes)
+							VALUES (?, 'sessionStorage', '', ?, ?, '')
+							""", (page_url, key, value))
+				except Exception as e:
+					logger.error(f"Error capturing sessionStorage for {page_url}: {e}")
+			
+			try:
+				full_storage = await self.session.context.storage_state()
+				print("Full storage state:", full_storage)
+				# Process cookies from full storage.
+				for cookie in full_storage.get("cookies", []):
+					storage_domain = cookie.get("domain", "")
+					key = cookie.get("name", "")
+					value = cookie.get("value", "")
+					other_attrs = {k: v for k, v in cookie.items() if k not in ["name", "value", "domain"]}
+					origin_url = cookie.get("domain", "")
+					cursor = conn.execute(
+						"SELECT 1 FROM storage WHERE storage_type = 'cookies' AND storage_domain = ? AND key = ? AND value = ?",
+						(storage_domain, key, value)
+					)
+					if cursor.fetchone() is None:
+						conn.execute("""
+						INSERT OR IGNORE INTO storage (page_url, storage_type, storage_domain, key, value, other_attributes)
+						VALUES (?, 'cookies', ?, ?, ?, ?)
+						""", (origin_url, storage_domain, key, value, json.dumps(other_attrs)))
+				
+				# Process localStorage from origins.
+				for origin in full_storage.get("origins", []):
+					origin_url = origin.get("origin", "")
+					parsed_origin = urlparse(origin_url)
+					storage_domain = parsed_origin.netloc if parsed_origin.netloc else ""
+					for item in origin.get("localStorage", []):
+						key = item.get("name", "")
+						value = item.get("value", "")
+						cursor = conn.execute(
+							"SELECT storage_domain FROM storage WHERE storage_type = 'localStorage' AND key = ? AND value = ?",
+							(key, value)
+						)
+						row = cursor.fetchone()
+						if row:
+							if not row[0]:
+								conn.execute(
+									"UPDATE storage SET storage_domain = ? WHERE storage_type = 'localStorage' AND key = ? AND value = ?",
+									(storage_domain, key, value)
+								)
+						else:
+							conn.execute("""
+							INSERT OR IGNORE INTO storage (page_url, storage_type, storage_domain, key, value, other_attributes)
+							VALUES (?, 'localStorage', ?, ?, ?, '')
+							""", (origin_url, storage_domain, key, value))
+					
+					# Process indexedDB from origins.
+					for item in origin.get("indexedDB", []):
+						key = item.get("name", "")
+						value = item.get("value", "")
+						other_attrs = {k: v for k, v in item.items() if k not in ["name", "value"]}
+						conn.execute("""
+						INSERT OR IGNORE INTO storage (page_url, storage_type, storage_domain, key, value, other_attributes)
+						VALUES (?, 'indexedDB', ?, ?, ?, ?)
+						""", (origin_url, storage_domain, key, value, json.dumps(other_attrs)))
+				
+				# For sessionStorage from full storage (if provided) – insert directly.
+				for item in full_storage.get("sessionStorage", []):
+					key = item.get("name", "")
+					value = item.get("value", "")
+					conn.execute("""
+					INSERT OR IGNORE INTO storage (page_url, storage_type, storage_domain, key, value, other_attributes)
+					VALUES (?, 'sessionStorage', '', ?, ?, '')
+					""", (origin_url, key, value))
+				
+				conn.commit()
+			except Exception as e:
+				logger.error(f"Error capturing full storage state: {e}")
+		except Exception as e:
+			logger.error(f"Error capturing storage data: {e}")
+
+	# endregion
+
+	# CUSTOM CODE: agentic-web-use
+	def update_db_filename(self):
+		try:
+			if self._network_db_conn:
+				cursor = self._network_db_conn.cursor()
+				cursor.execute("SELECT page_domain FROM network_traffic WHERE page_domain <> '' AND page_domain IS NOT NULL LIMIT 1")
+				row = cursor.fetchone()
+				if row and row[0]:
+					new_domain = row[0]
+					# Get current DB file path.
+					cursor.execute("PRAGMA database_list")
+					db_info = cursor.fetchone()
+					if db_info and len(db_info) >= 3:
+						current_path = db_info[2]
+					else:
+						return
+					# Close the connection.
+					self._network_db_conn.close()
+					try:
+						current_dir = os.path.dirname(os.path.abspath(__file__))
+					except NameError:
+						current_dir = os.getcwd()
+					output_dir = os.path.abspath(os.path.join(current_dir, "..", "..", "output"))
+					new_path = os.path.join(output_dir, f"{new_domain}.db")
+					os.rename(current_path, new_path)
+					# Reopen the connection.
+					self._network_db_conn = sqlite3.connect(new_path, check_same_thread=False)
+					logger.info(f"Renamed DB file to: {new_path}")
+		except Exception as e:
+			logger.error(f"Error updating DB filename: {e}")
+
 
 	async def reset_context(self):
 		"""Reset the browser session
@@ -1490,108 +1896,3 @@ class BrowserContext:
 		except Exception as e:
 			logger.debug(f'Failed to get CDP targets: {e}')
 			return []
-
-	async def _save_network_events_to_sqlite(self):
-		"""
-		CUSTOM METHOD: agentic-web-use
-		Aggregates network events from all pages in the current session and saves them
-		into an SQLite file under the output/ directory.
-		"""
-		import sqlite3
-		import json
-		import os
-		from urllib.parse import urlparse
-
-		# Determine page_url from collected network events
-		page_url = "unknown"
-		if self.session and getattr(self.session, "context", None):
-			for page in self.session.context.pages:
-				if hasattr(page, "_network_events"):
-					for event in page._network_events.values():
-						if "page_url" in event and event["page_url"]:
-							parsed = urlparse(event["page_url"])
-							if parsed.netloc:
-								page_url = parsed.netloc
-								break  # Stop at the first valid page_url
-		
-		# Create output directory if it doesn't exist.
-		output_dir = "output"
-		os.makedirs(output_dir, exist_ok=True)
-
-		# Construct final database file path
-		db_path = os.path.join(output_dir, f"{page_url}.db")
-
-		# Open a connection to the SQLite database.
-		conn = sqlite3.connect(db_path)
-		cur = conn.cursor()
-
-		# Create a table to store network events.
-		cur.execute('''
-			CREATE TABLE IF NOT EXISTS network_events (
-				id TEXT PRIMARY KEY,
-				page_url TEXT,
-				request_url TEXT,
-				request_method TEXT,
-				request_headers TEXT,
-				request_postData TEXT,
-				request_cookies TEXT,
-				redirect_chain TEXT,
-				request_timestamp REAL,
-				finished_at REAL,
-				error TEXT,
-				response_url TEXT,
-				response_status INTEGER,
-				response_status_text TEXT,
-				response_headers TEXT,
-				response_set_cookie TEXT,
-				response_body TEXT,
-				response_timestamp REAL
-			)
-		''')
-		conn.commit()
-
-		# Gather network events from all pages in the current context.
-		events = {}
-		if self.session and getattr(self.session, "context", None):
-			for page in self.session.context.pages:
-				if hasattr(page, "_network_events"):
-					events.update(page._network_events)
-		else:
-			logger.debug("No session context available; skipping network events saving.")
-			conn.close()
-			return
-
-		# Insert each event into the database.
-		for req_id, event in events.items():
-			req = event.get('request', {})
-			resp = event.get('response', {}) or {}
-			cur.execute('''
-				INSERT OR REPLACE INTO network_events (
-					id, page_url, request_url, request_method, request_headers, request_postData,
-					request_cookies, redirect_chain, request_timestamp, finished_at,
-					error, response_url, response_status, response_status_text,
-					response_headers, response_set_cookie, response_body, response_timestamp
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			''', (
-				str(req_id),
-				event.get('page_url'),
-				req.get('url'),
-				req.get('method'),
-				json.dumps(req.get('headers', {})),
-				req.get('postData'),
-				req.get('cookies'),
-				json.dumps(event.get('redirect_chain', [])),
-				event.get('timestamp'),
-				event.get('finished_at'),
-				event.get('error'),
-				resp.get('url'),
-				resp.get('status'),
-				resp.get('statusText'),
-				json.dumps(resp.get('headers', {})),
-				resp.get('set_cookie'),
-				resp.get('body'),
-				resp.get('timestamp'),
-			))
-		conn.commit()
-		conn.close()
-		logger.debug(f"Network events saved to SQLite database at {db_path}")
