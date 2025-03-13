@@ -170,7 +170,6 @@ class BrowserContext:
 		self.config = config
 		self.browser = browser
 		self._network_db_conn = None  # CUSTOM CODE: agentic-web-use
-		self._first_non_blank_domain = None  # CUSTOM CODE: agentic-web-use
 
 		self.state = state or BrowserContextState()
 
@@ -295,30 +294,14 @@ class BrowserContext:
 		# Bring page to front
 		await active_page.bring_to_front()
 		await active_page.wait_for_load_state('load')
+
+		# CUSTOM CODE: agentic-web-use: Attach network listeners for any new pages (tabs/popups)
+		active_page.context.on("page", lambda new_page: asyncio.create_task(self._setup_network_listeners(new_page)))
 		
 		# CUSTOM CODE: agentic-web-use
-		# If the active page URL is non-"about:blank" and the first non-blank domain is not set, do so now.
-		if not active_page.url.startswith("about:blank") and (not hasattr(self, "_first_non_blank_domain") or not self._first_non_blank_domain):
-			parsed = urlparse(active_page.url)
-			self._first_non_blank_domain = parsed.netloc or "unknown_domain"
 		await self._setup_network_listeners(active_page)
 
-
-
 		return self.session
-
-	def _add_new_page_listener(self, context: PlaywrightBrowserContext):
-		async def on_page(page: Page):
-			if self.browser.config.cdp_url:
-				await page.reload()  # Reload the page to avoid timeout errors
-			await page.wait_for_load_state()
-			logger.debug(f'New page opened: {page.url}')
-			await self._setup_network_listeners(page) # CUSTOM CODE: agentic-web-use
-			if self.session is not None:
-				self.state.target_id = None
-
-		self._page_event_handler = on_page
-		context.on('page', on_page)
 
 	async def get_session(self) -> BrowserSession:
 		"""Lazy initialization of the browser and related components"""
@@ -1336,16 +1319,32 @@ class BrowserContext:
 	
 	
 	# CUSTOM CODE: agentic-web-use
-	# region - Network Traffic and Per-Page Storage Capture
 	async def _setup_network_listeners(self, page: Page) -> None:
 		"""
 		Attaches network event listeners to capture complete network traffic,
 		including requests, responses, redirects, payloads, cookies, and stack traces.
 		This covers the main frame, all static and dynamic iframes, and new tabs/popups.
 		"""
+		async def handle_request(request):
+			await self._on_request(page, page.url, request)
+			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
+			try:
+				if not hasattr(page, "_cdp_network_session"):
+					page._cdp_network_session = await page.context.new_cdp_session(page)
+					await page._cdp_network_session.send("Network.enable")
+					page._cdp_network_session.on("Network.requestWillBeSent", lambda event: page._cdp_network_info.update(
+						{req_id: dict(event).get("initiator", {})}
+					))
+			except Exception as e:
+				print(f"CDP session setup failed: {e}")
+				logger.error(f"CDP session setup failed: {e}")
+		
 		if not hasattr(page, "_network_events"):
 			page._network_events = {}
-		page.on("request", lambda request: asyncio.create_task(self._on_request(request)))
+		if not hasattr(page, "_cdp_network_info"):
+			page._cdp_network_info = {}
+		# page.on("request", lambda request: asyncio.create_task(self._on_request(page.url, request)))
+		page.on("request", lambda request: asyncio.create_task(handle_request(request)))
 		page.on("response", lambda response: asyncio.create_task(self._on_response(response)))
 		page.on("requestfinished", lambda request: asyncio.create_task(self._on_request_finished(request)))
 		page.on("requestfailed", lambda request: asyncio.create_task(self._on_request_failed(request)))
@@ -1353,42 +1352,17 @@ class BrowserContext:
 		page.on("popup", lambda popup: asyncio.create_task(self._setup_network_listeners(popup)))
 		# Log frame attachments for debugging; network events from iframes are captured at the page level.
 		page.on("frameattached", lambda frame: logger.debug(f"Frame attached: {frame.url}"))
-		# Set up a CDP session to capture initiator/stack trace info.
-		try:
-			cdp_session = await page.context.new_cdp_session(page)
-			await cdp_session.send("Network.enable")
-			page._cdp_network_info = {}
-			cdp_session.on("Network.requestWillBeSent", lambda event: self._store_cdp_initiator(page, event))
-		except Exception as e:
-			logger.error(f"CDP session setup failed: {e}")
 
-
-	def _store_cdp_initiator(self, page: Page, event: dict) -> None:
-		"""
-		Stores initiator information (which may include stack trace details)
-		from the CDP Network.requestWillBeSent event.
-		"""
-		request_id = event.get("requestId")
-		if request_id:
-			page._cdp_network_info[request_id] = event.get("initiator")
-
-
-	async def _on_request(self, request: Request) -> None:
+	
+	# CUSTOM CODE: agentic-web-use
+	async def _on_request(self, page, page_url, request: Request) -> None:
 		try:
 			# Unique request identifier.
 			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
-			
-			# Determine the page URL from the main frame.
 			page_obj = getattr(request, "page", None)
-			if page_obj:
-				try:
-					page_url = page_obj.main_frame.url
-				except Exception:
-					page_url = page_obj.url
-			else:
-				page_url = request.url
 			parsed = urlparse(page_url)
 			page_domain = parsed.netloc if parsed.netloc else ""
+			print("\n\n$$$$$", req_id, page_url, "$$$$$\n\n")
 			
 			# Initialize the DB connection if not already done.
 			if self._network_db_conn is None:
@@ -1419,7 +1393,12 @@ class BrowserContext:
 						response_headers TEXT,
 						response_set_cookies TEXT,
 						response_body TEXT,
-						response_timestamp REAL,
+						response_timestamp REAL
+					)
+				""")
+				self._network_db_conn.execute("""
+					CREATE TABLE IF NOT EXISTS request_traces (
+						request_id TEXT PRIMARY KEY,
 						stack_trace TEXT
 					)
 				""")
@@ -1457,7 +1436,7 @@ class BrowserContext:
 						if value.startswith(b'\x1f\x8b'):
 							return "GZIP_DATA"
 						try:
-							return value.decode("utf-8")
+							return value.decode("utf-8", errors='ignore')
 						except Exception:
 							return base64.b64encode(value).decode("utf-8")
 					else:
@@ -1473,7 +1452,7 @@ class BrowserContext:
 					post_data = "GZIP_DATA"
 				else:
 					try:
-						post_data = post_data.decode("utf-8")
+						post_data = post_data.decode("utf-8", errors='ignore')
 					except Exception:
 						post_data = base64.b64encode(post_data).decode("utf-8")
 			elif post_data is None:
@@ -1482,22 +1461,7 @@ class BrowserContext:
 				post_data = str(post_data)
 			
 			safe_headers = {k: safe_decode(v) for k, v in request.headers.items()}
-			request_cookies = safe_decode(request.headers.get("cookie", ""))
-			
-			# Retrieve stack trace.
-			stack_trace = ""
-			try:
-				if hasattr(request, "_impl_obj") and hasattr(request._impl_obj, "_initializer"):
-					initializer = request._impl_obj._initializer
-					if "stackTrace" in initializer:
-						stack_trace = json.dumps(initializer["stackTrace"])
-				if not stack_trace and page_obj and hasattr(page_obj, "_cdp_network_info"):
-					for _, initiator in page_obj._cdp_network_info.items():
-						if initiator and "stack" in initiator:
-							stack_trace = json.dumps(initiator.get("stack", {}))
-							break
-			except Exception as e:
-				logger.error(f"Error getting stack trace: {e}")
+			request_cookies = {k.lower(): v for k, v in request.headers.items()}.get("cookie", "")
 			
 			# Insert network data.
 			conn = self._network_db_conn
@@ -1505,8 +1469,8 @@ class BrowserContext:
 				conn.execute("""
 					INSERT INTO network_traffic (
 						request_id, page_url, page_domain, request_url, request_method, request_headers, request_postData,
-						request_cookies, redirect_chain, request_timestamp, stack_trace
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+						request_cookies, redirect_chain, request_timestamp
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				""", (
 					req_id,
 					page_url,
@@ -1517,9 +1481,19 @@ class BrowserContext:
 					post_data,
 					request_cookies,
 					json.dumps(redirect_chain),
-					req_timestamp,
-					stack_trace
+					req_timestamp
 				))
+				# For every key–value pair in page._cdp_network_info, insert into request_traces if not already present.
+				for trace_req_id, trace_info in page._cdp_network_info.items():
+					# Check if this request_id already exists in request_traces.
+					cursor = conn.execute("SELECT 1 FROM request_traces WHERE request_id = ?", (trace_req_id,))
+					if not cursor.fetchone():
+						conn.execute("""
+							INSERT INTO request_traces (
+								request_id, stack_trace
+							) VALUES (?, ?)
+						""", (trace_req_id, json.dumps(trace_info)))
+				
 				conn.commit()
 			
 			if page_obj is not None:
@@ -1527,19 +1501,20 @@ class BrowserContext:
 					page_obj._network_events = {}
 				page_obj._network_events[req_id] = {"timestamp": req_timestamp}
 			
-			print("*Req*", req_id, request.url)
+			# print("*Request*", req_id, request.url)
 		except Exception as e:
+			print(f"Error in _on_request: {e}")
 			logger.error(f"Error in _on_request: {e}")
 
-
+	
+	# CUSTOM CODE: agentic-web-use
 	async def _on_response(self, response: Response) -> None:
 		try:
 			request = response.request
 			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
 			resp_timestamp = time.time()
 			headers = response.headers
-			# Capture set-cookie header.
-			response_set_cookies = headers.get("set-cookie", "")
+			response_set_cookies = {k.lower(): v for k, v in headers.items()}.get("set-cookie", "")
 			try:
 				body_bytes = await response.body()
 				try:
@@ -1571,11 +1546,13 @@ class BrowserContext:
 					req_id
 				))
 				conn.commit()
-			print("*Resp*", req_id, response.url)
+			# print("*Response:*", req_id, response.url)
 		except Exception as e:
+			print(f"Error in _on_response: {e}")
 			logger.error(f"Error in _on_response: {e}")
 
-
+	
+	# CUSTOM CODE: agentic-web-use
 	async def _on_request_finished(self, request: Request) -> None:
 		try:
 			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
@@ -1589,9 +1566,11 @@ class BrowserContext:
 				""", (finished_at, req_id))
 				conn.commit()
 		except Exception as e:
+			print(f"Error in _on_request_finished: {e}")
 			logger.error(f"Error in _on_request_finished: {e}")
 
-
+	
+	# CUSTOM CODE: agentic-web-use
 	async def _on_request_failed(self, request: Request) -> None:
 		try:
 			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
@@ -1613,12 +1592,13 @@ class BrowserContext:
 				))
 				conn.commit()
 		except Exception as e:
+			print(f"Error in _on_request_failed: {e}")
 			logger.error(f"Error in _on_request_failed: {e}")
 
-
+	
+	# CUSTOM CODE: agentic-web-use
 	async def capture_storage_data(self) -> None:
 		try:
-			captured_at = time.time()
 			# Initialize DB if not already done.
 			if self._network_db_conn is None:
 				try:
@@ -1839,7 +1819,6 @@ class BrowserContext:
 						current_path = db_info[2]
 					else:
 						return
-					# Close the connection.
 					self._network_db_conn.close()
 					try:
 						current_dir = os.path.dirname(os.path.abspath(__file__))
