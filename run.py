@@ -3,6 +3,8 @@ from langchain_openai import ChatOpenAI
 from browser_use.browser.context import BrowserContext
 from browser_use.browser.context import BrowserContextConfig
 from browser_use import BrowserConfig
+import asyncio
+import sys
 import os
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/yvekaria/.config/gcloud/application_default_credentials.json"
 
@@ -46,9 +48,12 @@ IMPORTANT: If at any point you do not know what to input in the form, make an ed
 
 
 # Defining an asynchronous function
-async def main():
+async def main(website=None):
+    if website is None and len(sys.argv) > 1:
+        website = sys.argv[1]
+    
     agent = Agent(
-        task="Visit netquote.com and fill the form as an individual looking for the services offered by the website.",
+        task=f"Visit {website} and fill the form as an individual looking for the services offered by the website.",
         llm=ChatOpenAI(model="gpt-4o"),
         browser=browser,  # Browser instance will be reused
         context=context,
@@ -61,6 +66,7 @@ async def main():
     # Manually close the browser
     await browser.close()
 
-# Run the main async function
-import asyncio
-asyncio.run(main())
+if __name__ == "__main__":
+    website = sys.argv[1] if len(sys.argv) > 1 else None
+    # Run the main async function
+    asyncio.run(main(website))

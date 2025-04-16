@@ -1362,7 +1362,7 @@ class BrowserContext:
 			page_obj = getattr(request, "page", None)
 			parsed = urlparse(page_url)
 			page_domain = parsed.netloc if parsed.netloc else ""
-			print("\n\n$$$$$", req_id, page_url, "$$$$$\n\n")
+			# print("\n\n$$$$$", req_id, page_url, "$$$$$\n\n")
 			
 			# Initialize the DB connection if not already done.
 			if self._network_db_conn is None:
