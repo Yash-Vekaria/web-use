@@ -2,6 +2,8 @@ import os
 import sys
 from pathlib import Path
 
+import anyio
+
 from browser_use.agent.views import ActionResult
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 browser = Browser(
 	config=BrowserConfig(
 		headless=False,
-		chrome_instance_path='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+		browser_binary_path='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
 	)
 )
 controller = Controller()
@@ -68,8 +70,8 @@ async def read_file(path: str, available_file_paths: list[str]):
 	if path not in available_file_paths:
 		return ActionResult(error=f'File path {path} is not available')
 
-	with open(path, 'r') as f:
-		content = f.read()
+	async with (await anyio.open_file(path, 'r')) as f:
+		content = await f.read()
 	msg = f'File content: {content}'
 	logger.info(msg)
 	return ActionResult(extracted_content=msg, include_in_memory=True)
@@ -84,7 +86,7 @@ def create_file(file_type: str = 'txt'):
 
 
 async def main():
-	task = f'Go to https://kzmpmkh2zfk1ojnpxfn1.lite.vusercontent.net/ and - read the file content and upload them to fields'
+	task = 'Go to https://kzmpmkh2zfk1ojnpxfn1.lite.vusercontent.net/ and - read the file content and upload them to fields'
 
 	available_file_paths = [create_file('txt'), create_file('pdf'), create_file('csv')]
 

@@ -22,6 +22,16 @@ from browser_use.dom.history_tree_processor.service import (
 from browser_use.dom.views import SelectorMap
 
 ToolCallingMethod = Literal['function_calling', 'json_mode', 'raw', 'auto']
+REQUIRED_LLM_API_ENV_VARS = {
+	'ChatOpenAI': ['OPENAI_API_KEY'],
+	'AzureChatOpenAI': ['AZURE_OPENAI_ENDPOINT', 'AZURE_OPENAI_KEY'],
+	'ChatBedrockConverse': ['ANTHROPIC_API_KEY'],
+	'ChatAnthropic': ['ANTHROPIC_API_KEY'],
+	'ChatGoogleGenerativeAI': ['GEMINI_API_KEY'],
+	'ChatDeepSeek': ['DEEPSEEK_API_KEY'],
+	'ChatOllama': [],
+	'ChatGrok': ['GROK_API_KEY'],
+}
 
 
 class AgentSettings(BaseModel):
@@ -58,6 +68,8 @@ class AgentSettings(BaseModel):
 	page_extraction_llm: Optional[BaseChatModel] = None
 	planner_llm: Optional[BaseChatModel] = None
 	planner_interval: int = 1  # Run planner every N steps
+	is_planner_reasoning: bool = False  # type: ignore
+	extend_planner_system_message: Optional[str] = None
 
 
 class AgentState(BaseModel):
@@ -166,7 +178,7 @@ class AgentHistory(BaseModel):
 		elements = []
 		for action in model_output.action:
 			index = action.get_index()
-			if index and index in selector_map:
+			if index is not None and index in selector_map:
 				el: DOMElementNode = selector_map[index]
 				elements.append(HistoryTreeProcessor.convert_dom_element_to_history_element(el))
 			else:

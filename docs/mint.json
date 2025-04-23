@@ -60,7 +60,8 @@
         "customize/output-format",
         "customize/system-prompt",
         "customize/sensitive-data",
-        "customize/custom-functions"
+        "customize/custom-functions",
+        "customize/hooks"
       ]
     },
     {
@@ -69,6 +70,7 @@
         "development/local-setup",
         "development/telemetry",
         "development/observability",
+        "development/evaluations",
         "development/roadmap"
       ]
     },
