@@ -4,6 +4,7 @@ Playwright browser on steroids.
 
 import asyncio
 import gc
+import time
 import logging
 from dataclasses import dataclass, field
 
@@ -223,6 +224,7 @@ class Browser:
 
 	async def close(self):
 		"""Close the browser instance"""
+		time.sleep(10)
 		try:
 			if not self.config._force_keep_browser_alive:
 				if self.playwright_browser:

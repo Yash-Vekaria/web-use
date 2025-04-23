@@ -658,6 +658,7 @@ class BrowserContext:
 		"""Close the current tab"""
 		session = await self.get_session()
 		page = await self._get_current_page(session)
+		time.sleep(20)
 		await page.close()
 
 		# Switch to the first available tab if any exist
@@ -1461,7 +1462,8 @@ class BrowserContext:
 				post_data = str(post_data)
 			
 			safe_headers = {k: safe_decode(v) for k, v in request.headers.items()}
-			request_cookies = {k.lower(): v for k, v in request.headers.items()}.get("cookie", "")
+			request_headers = {k.lower(): v for k, v in request.headers.items()}
+			request_cookies = request_headers.get("cookie", "")
 			
 			# Insert network data.
 			conn = self._network_db_conn
@@ -1514,7 +1516,8 @@ class BrowserContext:
 			req_id = request._guid if hasattr(request, "_guid") else str(id(request))
 			resp_timestamp = time.time()
 			headers = response.headers
-			response_set_cookies = {k.lower(): v for k, v in headers.items()}.get("set-cookie", "")
+			response_headers = {k.lower(): v for k, v in response.headers.items()}
+			response_set_cookies = response_headers.get("set-cookie", "")
 			try:
 				body_bytes = await response.body()
 				try:
